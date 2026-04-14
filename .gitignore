@@ -1,0 +1,43 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude/
+
+# Model checkpoints (large, managed separately)
+models/
+
+# Training run outputs
+rl_runs/
+
+# Experiment artifacts
+artifacts/
+
+# Rollout data (tens of GB, stored locally)
+rollouts/
+rollouts_v2/
+
+# Sweep / evaluation outputs (kept locally, not pushed)
+sweep_*.py
+sweep_*.csv
+sweep_*.txt
+*.csv
+
+# Old / archived code
+archive/
+
+# One-off diagnostics
+diag_*.py

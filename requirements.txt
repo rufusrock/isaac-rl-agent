@@ -1,0 +1,7 @@
+torch
+numpy
+opencv-python
+mss
+pywin32
+tqdm
+matplotlib

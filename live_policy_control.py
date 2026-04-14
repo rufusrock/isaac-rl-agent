@@ -1,0 +1,287 @@
+from __future__ import annotations
+
+import argparse
+import time
+
+import cv2
+
+from binding_rl_agent.env import (
+    BOMB_KEY_MAP,
+    IsaacAction,
+    IsaacFrameEnv,
+    MOVEMENT_KEY_MAP,
+    ObservationConfig,
+    SHOOTING_KEY_MAP,
+)
+from binding_rl_agent.inference import (
+    find_latest_model,
+    frame_size_from_checkpoint,
+    load_policy_checkpoint,
+    obs_config_from_checkpoint,
+    predict_policy,
+    prediction_to_action,
+)
+from binding_rl_agent.input_controller import (
+    is_function_key_pressed,
+    release_all_agent_keys,
+    sync_pressed_keys,
+    tap_key,
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run a safety-gated live policy controller for Isaac. "
+            "Starts disarmed and only sends inputs when armed."
+        )
+    )
+    parser.add_argument("--model-path", default=None, help="Optional checkpoint path.")
+    parser.add_argument("--title", default=None, help="Optional game window title substring.")
+    parser.add_argument("--width", type=int, default=None, help="Observation width (default: from checkpoint).")
+    parser.add_argument("--height", type=int, default=None, help="Observation height (default: from checkpoint).")
+    parser.add_argument("--fps", type=int, default=10, help="Control loop FPS.")
+    parser.add_argument(
+        "--movement-threshold",
+        type=float,
+        default=0.35,
+        help="Confidence threshold below which movement becomes idle.",
+    )
+    parser.add_argument(
+        "--shooting-threshold",
+        type=float,
+        default=0.35,
+        help="Confidence threshold below which shooting becomes idle.",
+    )
+    parser.add_argument(
+        "--bomb-threshold",
+        type=float,
+        default=0.95,
+        help="Confidence threshold required before bomb is pressed.",
+    )
+    parser.add_argument(
+        "--preview-scale",
+        type=int,
+        default=4,
+        help="Scale factor for the preview window.",
+    )
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Use argmax actions (sets all thresholds to 0, bomb threshold to 0.5).",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=float,
+        default=5.0,
+        help="Seconds to wait before arming becomes available (default 5).",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    model_path = args.model_path or str(find_latest_model())
+    model, device, checkpoint = load_policy_checkpoint(model_path)
+    checkpoint_frame_size = frame_size_from_checkpoint(checkpoint)
+    width = args.width or checkpoint_frame_size
+    height = args.height or checkpoint_frame_size
+
+    if args.deterministic:
+        movement_threshold = 0.0
+        shooting_threshold = 0.0
+        bomb_threshold = 0.5
+    else:
+        movement_threshold = args.movement_threshold
+        shooting_threshold = args.shooting_threshold
+        bomb_threshold = args.bomb_threshold
+
+    obs_kwargs = obs_config_from_checkpoint(checkpoint)
+    env = IsaacFrameEnv(
+        title_substring=args.title,
+        observation_config=ObservationConfig(
+            width=width,
+            height=height,
+            **obs_kwargs,
+        ),
+    )
+
+    armed = False
+    emergency_stop = False
+    previous_f8 = False
+    previous_f9 = False
+    previous_bomb = 0
+    active_agent_keys: set[str] = set()
+
+    observation = env.reset()
+
+    print(f"Loaded model: {model_path}")
+    print(f"Using device: {device}")
+    print(f"Capturing window: {env.capture.window.title}")
+    print("Controls: F8 arm/disarm, F9 emergency stop, F10 quit, q quit preview")
+    print("Tip: when armed, the controller will try to refocus the Isaac window.")
+
+    warmup_until = time.monotonic() + args.warmup
+    if args.warmup > 0:
+        print(f"Warmup: {args.warmup:.0f}s before arming is available...")
+
+    frame_delay = 1.0 / max(args.fps, 1)
+    next_tick = time.monotonic()
+
+    while True:
+        now = time.monotonic()
+        warmup_remaining = max(0.0, warmup_until - now)
+        in_warmup = warmup_remaining > 0.0
+
+        armed, emergency_stop, previous_f8, previous_f9 = _update_safety_state(
+            armed=armed,
+            emergency_stop=emergency_stop,
+            previous_f8=previous_f8,
+            previous_f9=previous_f9,
+            allow_arm=not in_warmup,
+        )
+        if is_function_key_pressed("f10"):
+            break
+
+        observation = env.step(action=None)
+        prediction = predict_policy(model, device, observation, checkpoint=checkpoint)
+        selected_action = prediction_to_action(
+            prediction,
+            movement_threshold=movement_threshold,
+            shooting_threshold=shooting_threshold,
+            bomb_threshold=bomb_threshold,
+        )
+        game_has_focus = env.capture.is_foreground()
+
+        if armed and not emergency_stop:
+            if not game_has_focus:
+                env.capture.focus_window()
+                time.sleep(0.02)
+                game_has_focus = env.capture.is_foreground()
+
+        if armed and not emergency_stop and game_has_focus:
+            desired_keys = (
+                MOVEMENT_KEY_MAP[selected_action.movement]
+                + SHOOTING_KEY_MAP[selected_action.shooting]
+            )
+            active_agent_keys = sync_pressed_keys(desired_keys, active_agent_keys)
+            if selected_action.bomb == 1 and previous_bomb == 0:
+                for bomb_key in BOMB_KEY_MAP[1]:
+                    tap_key(bomb_key, hold_seconds=0.05)
+        else:
+            active_agent_keys = sync_pressed_keys([], active_agent_keys)
+            release_all_agent_keys()
+        previous_bomb = selected_action.bomb
+
+        preview = cv2.cvtColor(observation[-1], cv2.COLOR_GRAY2BGR)
+        if args.preview_scale != 1:
+            preview = cv2.resize(
+                preview,
+                (preview.shape[1] * args.preview_scale, preview.shape[0] * args.preview_scale),
+                interpolation=cv2.INTER_NEAREST,
+            )
+
+        _draw_overlay(
+            preview=preview,
+            model_path=model_path,
+            prediction=prediction,
+            selected_action=selected_action,
+            armed=armed,
+            emergency_stop=emergency_stop,
+            game_has_focus=game_has_focus,
+            warmup_remaining=warmup_remaining,
+        )
+        cv2.imshow("Isaac Live Policy Control", preview)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+        next_tick += frame_delay
+        sleep_for = next_tick - time.monotonic()
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+
+    active_agent_keys = sync_pressed_keys([], active_agent_keys)
+    release_all_agent_keys()
+    cv2.destroyAllWindows()
+
+
+def _update_safety_state(
+    armed: bool,
+    emergency_stop: bool,
+    previous_f8: bool,
+    previous_f9: bool,
+    allow_arm: bool = True,
+) -> tuple[bool, bool, bool, bool]:
+    current_f8 = is_function_key_pressed("f8")
+    current_f9 = is_function_key_pressed("f9")
+
+    if current_f9 and not previous_f9:
+        emergency_stop = not emergency_stop
+        if emergency_stop:
+            armed = False
+            release_all_agent_keys()
+
+    if current_f8 and not previous_f8 and not emergency_stop and allow_arm:
+        armed = not armed
+        if not armed:
+            release_all_agent_keys()
+
+    return armed, emergency_stop, current_f8, current_f9
+
+
+def _draw_overlay(
+    preview,
+    model_path: str,
+    prediction,
+    selected_action: IsaacAction,
+    armed: bool,
+    emergency_stop: bool,
+    game_has_focus: bool,
+    warmup_remaining: float = 0.0,
+) -> None:
+    if warmup_remaining > 0.0:
+        status = f"WARMUP {warmup_remaining:.1f}s"
+    elif emergency_stop:
+        status = "EMERGENCY STOP"
+    elif armed:
+        status = "ARMED"
+    else:
+        status = "DISARMED"
+    focus_label = "FOCUSED" if game_has_focus else "NOT FOCUSED"
+    overlay_lines = [
+        f"model: {model_path}",
+        f"status: {status}",
+        f"game: {focus_label}",
+        (
+            f"move: {prediction.movement.label} ({prediction.movement.confidence:.2f}) "
+            f"-> {selected_action.movement}"
+        ),
+        (
+            f"shoot: {prediction.shooting.label} ({prediction.shooting.confidence:.2f}) "
+            f"-> {selected_action.shooting}"
+        ),
+        (
+            f"bomb: {prediction.bomb.label} ({prediction.bomb.confidence:.2f}) "
+            f"-> {selected_action.bomb}"
+        ),
+        "F8: arm/disarm",
+        "F9: emergency stop toggle",
+        "F10/q: quit",
+    ]
+
+    color = (64, 64, 255) if emergency_stop else ((80, 220, 120) if armed else ((180, 180, 180) if warmup_remaining > 0.0 else (240, 210, 90)))
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    for idx, line in enumerate(overlay_lines):
+        y = 20 + idx * 22
+        if idx == 1:
+            text_color = color
+        elif idx == 2:
+            text_color = (80, 220, 120) if game_has_focus else (64, 64, 255)
+        else:
+            text_color = (245, 245, 245)
+        cv2.putText(preview, line, (8, y), font, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(preview, line, (8, y), font, 0.5, text_color, 1, cv2.LINE_AA)
+
+
+if __name__ == "__main__":
+    main()
