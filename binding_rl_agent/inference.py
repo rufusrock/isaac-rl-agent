@@ -20,6 +20,7 @@ class HeadPrediction:
     index: int
     label: str
     confidence: float
+    probabilities: tuple[float, ...]
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,10 @@ def load_policy_checkpoint(model_path: str | Path) -> tuple[IsaacCNNPolicy, torc
             input_channels += stack_size - 1
 
     use_nav_hint_embedding = bool(checkpoint.get("use_nav_hint_embedding", False))
+    arch = train_cfg.get("arch", "plain")
+    norm_type = train_cfg.get("norm_type", None)
+    num_resblocks = int(train_cfg.get("num_resblocks", 2))
+    dropout = float(train_cfg.get("dropout", 0.0))
     model = IsaacCNNPolicy(
         input_channels=input_channels,
         input_size=frame_size,
@@ -79,6 +84,10 @@ def load_policy_checkpoint(model_path: str | Path) -> tuple[IsaacCNNPolicy, torc
         conv_channels=conv_channels,
         hidden_dim=hidden_dim,
         use_nav_hint_embedding=use_nav_hint_embedding,
+        arch=arch,
+        norm_type=norm_type,
+        num_resblocks=num_resblocks,
+        dropout=dropout,
     )
     state_dict = checkpoint["model_state_dict"]
     # Old checkpoints may contain BatchNorm weights that no longer exist in the
@@ -128,13 +137,17 @@ def predict_policy(
         ``use_nav_hint_embedding=True``; if omitted the model falls back to
         STAY (class 0) via its own forward-pass default.
     """
-    observation_tensor = (
-        torch.from_numpy(observation)
-        .float()
-        .unsqueeze(0)
-        .to(device)
-        / 255.0
-    )
+    obs_f = torch.from_numpy(observation).float() / 255.0
+    # Append motion (frame-diff) channels if the model expects them.
+    train_cfg = checkpoint.get("train_config", {}) if checkpoint else {}
+    if train_cfg.get("motion_channels", False) and obs_f.shape[0] > 1:
+        stack_size = obs_f.shape[0]  # C dimension = stack_size for gray
+        diffs = [
+            (obs_f[t:t + 1] - obs_f[t - 1:t]).abs()
+            for t in range(1, stack_size)
+        ]
+        obs_f = torch.cat([obs_f, *diffs], dim=0)
+    observation_tensor = obs_f.unsqueeze(0).to(device)
 
     nav_hint_tensor: torch.Tensor | None = None
     if nav_hint is not None:
@@ -172,7 +185,12 @@ def _decode_head(logits: torch.Tensor, label_map: dict[int, str]) -> HeadPredict
     probabilities = torch.softmax(logits[0], dim=0)
     index = int(torch.argmax(probabilities).item())
     confidence = float(probabilities[index].item())
-    return HeadPrediction(index=index, label=label_map[index], confidence=confidence)
+    return HeadPrediction(
+        index=index,
+        label=label_map[index],
+        confidence=confidence,
+        probabilities=tuple(float(p) for p in probabilities.tolist()),
+    )
 
 
 def prediction_to_action(

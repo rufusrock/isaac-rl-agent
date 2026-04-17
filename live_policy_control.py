@@ -13,10 +13,12 @@ from binding_rl_agent.env import (
     ObservationConfig,
     SHOOTING_KEY_MAP,
 )
+from binding_rl_agent.game_state import IsaacUDPGameStateReceiver
 from binding_rl_agent.inference import (
     find_latest_model,
     frame_size_from_checkpoint,
     load_policy_checkpoint,
+    nav_hint_from_room_graph,
     obs_config_from_checkpoint,
     predict_policy,
     prediction_to_action,
@@ -27,6 +29,7 @@ from binding_rl_agent.input_controller import (
     sync_pressed_keys,
     tap_key,
 )
+from binding_rl_agent.room_graph import NavHint, RoomGraph
 
 
 def parse_args() -> argparse.Namespace:
@@ -76,6 +79,20 @@ def parse_args() -> argparse.Namespace:
         default=5.0,
         help="Seconds to wait before arming becomes available (default 5).",
     )
+    parser.add_argument(
+        "--telemetry-port",
+        type=int,
+        default=8123,
+        help="UDP telemetry port for room-graph nav hints.",
+    )
+    parser.add_argument(
+        "--force-non-idle",
+        action="store_true",
+        help=(
+            "When movement/shooting predicts idle as the top class, override it "
+            "with the best non-idle class instead."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -83,6 +100,7 @@ def main() -> None:
     args = parse_args()
     model_path = args.model_path or str(find_latest_model())
     model, device, checkpoint = load_policy_checkpoint(model_path)
+    use_nav_hint_embedding = bool(checkpoint.get("use_nav_hint_embedding", False))
     checkpoint_frame_size = frame_size_from_checkpoint(checkpoint)
     width = args.width or checkpoint_frame_size
     height = args.height or checkpoint_frame_size
@@ -105,6 +123,15 @@ def main() -> None:
             **obs_kwargs,
         ),
     )
+    telemetry: IsaacUDPGameStateReceiver | None = None
+    if use_nav_hint_embedding:
+        try:
+            telemetry = IsaacUDPGameStateReceiver(port=args.telemetry_port)
+        except OSError as exc:
+            print(
+                f"[WARN] Could not bind telemetry port {args.telemetry_port}: {exc}. "
+                "Nav-hint-enabled model will fall back to STAY hints."
+            )
 
     armed = False
     emergency_stop = False
@@ -112,12 +139,19 @@ def main() -> None:
     previous_f9 = False
     previous_bomb = 0
     active_agent_keys: set[str] = set()
+    latest_nav_hint: int | None = None
+    nav_status = "disabled"
 
     observation = env.reset()
 
     print(f"Loaded model: {model_path}")
     print(f"Using device: {device}")
     print(f"Capturing window: {env.capture.window.title}")
+    if use_nav_hint_embedding:
+        if telemetry is not None:
+            print(f"Nav hint telemetry listening on UDP port {args.telemetry_port}")
+        else:
+            print("Nav hint input unavailable; using fallback STAY hint.")
     print("Controls: F8 arm/disarm, F9 emergency stop, F10 quit, q quit preview")
     print("Tip: when armed, the controller will try to refocus the Isaac window.")
 
@@ -144,13 +178,36 @@ def main() -> None:
             break
 
         observation = env.step(action=None)
-        prediction = predict_policy(model, device, observation, checkpoint=checkpoint)
+        nav_hint = None
+        if use_nav_hint_embedding:
+            if telemetry is None:
+                nav_status = "fallback STAY (telemetry bind failed)"
+            else:
+                game_state = telemetry.get_latest()
+                if game_state is not None and game_state.floor_rooms:
+                    graph = RoomGraph(game_state.floor_rooms)
+                    nav_hint = nav_hint_from_room_graph(graph, game_state.room_index)
+                    latest_nav_hint = nav_hint
+                    nav_status = _nav_hint_label(nav_hint)
+                elif game_state is not None:
+                    nav_status = "fallback STAY (no room graph)"
+                else:
+                    nav_status = "fallback STAY (waiting for telemetry)"
+        prediction = predict_policy(
+            model,
+            device,
+            observation,
+            checkpoint=checkpoint,
+            nav_hint=nav_hint,
+        )
         selected_action = prediction_to_action(
             prediction,
             movement_threshold=movement_threshold,
             shooting_threshold=shooting_threshold,
             bomb_threshold=bomb_threshold,
         )
+        if args.force_non_idle:
+            selected_action = _force_non_idle_action(selected_action, prediction)
         game_has_focus = env.capture.is_foreground()
 
         if armed and not emergency_stop:
@@ -190,6 +247,10 @@ def main() -> None:
             emergency_stop=emergency_stop,
             game_has_focus=game_has_focus,
             warmup_remaining=warmup_remaining,
+            nav_status=nav_status,
+            model_uses_nav_hint=use_nav_hint_embedding,
+            latest_nav_hint=latest_nav_hint,
+            force_non_idle=args.force_non_idle,
         )
         cv2.imshow("Isaac Live Policy Control", preview)
         if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -238,6 +299,10 @@ def _draw_overlay(
     emergency_stop: bool,
     game_has_focus: bool,
     warmup_remaining: float = 0.0,
+    nav_status: str = "disabled",
+    model_uses_nav_hint: bool = False,
+    latest_nav_hint: int | None = None,
+    force_non_idle: bool = False,
 ) -> None:
     if warmup_remaining > 0.0:
         status = f"WARMUP {warmup_remaining:.1f}s"
@@ -252,6 +317,12 @@ def _draw_overlay(
         f"model: {model_path}",
         f"status: {status}",
         f"game: {focus_label}",
+        (
+            f"nav: {nav_status}"
+            if model_uses_nav_hint
+            else "nav: not used by model"
+        ),
+        f"non-idle override: {'ON' if force_non_idle else 'OFF'}",
         (
             f"move: {prediction.movement.label} ({prediction.movement.confidence:.2f}) "
             f"-> {selected_action.movement}"
@@ -277,10 +348,62 @@ def _draw_overlay(
             text_color = color
         elif idx == 2:
             text_color = (80, 220, 120) if game_has_focus else (64, 64, 255)
+        elif idx == 3 and model_uses_nav_hint and latest_nav_hint is not None:
+            text_color = _nav_hint_color(latest_nav_hint)
         else:
             text_color = (245, 245, 245)
         cv2.putText(preview, line, (8, y), font, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(preview, line, (8, y), font, 0.5, text_color, 1, cv2.LINE_AA)
+
+
+def _nav_hint_label(nav_hint: int) -> str:
+    labels = {
+        int(NavHint.STAY): "STAY",
+        int(NavHint.NORTH): "NORTH",
+        int(NavHint.SOUTH): "SOUTH",
+        int(NavHint.WEST): "WEST",
+        int(NavHint.EAST): "EAST",
+    }
+    return labels.get(nav_hint, f"UNKNOWN({nav_hint})")
+
+
+def _nav_hint_color(nav_hint: int) -> tuple[int, int, int]:
+    colors = {
+        int(NavHint.STAY): (180, 180, 180),
+        int(NavHint.NORTH): (255, 210, 80),
+        int(NavHint.SOUTH): (80, 180, 255),
+        int(NavHint.WEST): (120, 220, 120),
+        int(NavHint.EAST): (220, 120, 220),
+    }
+    return colors.get(nav_hint, (245, 245, 245))
+
+
+def _force_non_idle_action(selected_action: IsaacAction, prediction) -> IsaacAction:
+    movement = selected_action.movement
+    shooting = selected_action.shooting
+
+    if prediction.movement.index == 0:
+        movement = _best_non_idle_index(prediction.movement.probabilities)
+    if prediction.shooting.index == 0:
+        shooting = _best_non_idle_index(prediction.shooting.probabilities)
+
+    return IsaacAction(
+        movement=movement,
+        shooting=shooting,
+        bomb=selected_action.bomb,
+    )
+
+
+def _best_non_idle_index(probabilities: tuple[float, ...]) -> int:
+    if len(probabilities) <= 1:
+        return 0
+    best_index = 1
+    best_prob = probabilities[1]
+    for idx in range(2, len(probabilities)):
+        if probabilities[idx] > best_prob:
+            best_index = idx
+            best_prob = probabilities[idx]
+    return best_index
 
 
 if __name__ == "__main__":

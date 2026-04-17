@@ -38,6 +38,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout",     type=float, default=defaults.dropout)
     parser.add_argument("--no-batchnorm", action="store_true",
                         help="Disable batch normalisation in conv layers")
+    parser.add_argument("--arch", choices=["plain", "impala", "nature"], default=defaults.arch)
+    parser.add_argument("--norm-type", choices=["batch", "layer", "group", "none"],
+                        default=defaults.norm_type)
+    parser.add_argument("--num-resblocks", type=int, default=defaults.num_resblocks)
+    parser.add_argument("--aug-mode", choices=["flip", "flip+drq", "flip+jitter", "drq", "jitter", "none"],
+                        default=defaults.aug_mode)
+    # Holdout / early stopping
+    parser.add_argument("--holdout-run", default=None,
+                        help="Run name to exclude from train/val and use as holdout")
+    parser.add_argument("--early-stop-on-holdout", action="store_true",
+                        help="Use holdout loss (not val loss) for early stopping")
     # Misc
     parser.add_argument("--movement-idle-weight",      type=float, default=defaults.movement_idle_weight)
     parser.add_argument("--movement-direction-weight", type=float, default=defaults.movement_direction_weight)
@@ -79,6 +90,12 @@ def main() -> None:
             hidden_dim=args.hidden_dim,
             dropout=args.dropout,
             use_batchnorm=not args.no_batchnorm,
+            arch=args.arch,
+            norm_type=args.norm_type,
+            num_resblocks=args.num_resblocks,
+            aug_mode=args.aug_mode,
+            holdout_run=args.holdout_run,
+            early_stop_on_holdout=args.early_stop_on_holdout,
             movement_idle_weight=args.movement_idle_weight,
             movement_direction_weight=args.movement_direction_weight,
             shooting_idle_weight=args.shooting_idle_weight,

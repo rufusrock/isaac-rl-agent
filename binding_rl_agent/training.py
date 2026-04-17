@@ -35,6 +35,7 @@ class TrainConfig:
     movement_direction_weight: float = 1.0
     shooting_idle_weight: float = 1.0
     early_stop_patience: int = 0
+    early_stop_on_holdout: bool = False  # use holdout loss instead of val loss for early stopping
     weight_decay: float = 1e-4
     augment: bool = True
     # Observation preprocessing
@@ -219,6 +220,19 @@ def train_behavior_cloning(config: TrainConfig | None = None) -> TrainResult:
             optimizer, T_max=train_config.epochs, eta_min=train_config.learning_rate * 0.01
         )
 
+    # Build holdout loader up-front if we need it for per-epoch early stopping.
+    holdout_loader: DataLoader | None = None
+    if holdout_dataset is not None and train_config.early_stop_on_holdout:
+        holdout_loader = DataLoader(
+            holdout_dataset,
+            batch_size=train_config.batch_size,
+            shuffle=False,
+            num_workers=effective_workers,
+            persistent_workers=effective_workers > 0,
+            pin_memory=use_pin,
+            prefetch_factor=2 if effective_workers > 0 else None,
+        )
+
     history: list[dict[str, float]] = []
     best_val_loss = float("inf")
     best_model_state: dict | None = None
@@ -262,31 +276,56 @@ def train_behavior_cloning(config: TrainConfig | None = None) -> TrainResult:
         epoch_bar.set_postfix_str(
             f"train={train_loss:.4f} val={val_metrics['val_loss']:.4f} | {acc_str} | {epoch_elapsed:.0f}s/ep"
         )
+        # Per-epoch holdout eval for early stopping when configured.
+        if holdout_loader is not None:
+            holdout_epoch_metrics = _evaluate(
+                model=model,
+                loader=holdout_loader,
+                criteria=criteria,
+                device=device,
+                loss_weights=loss_weights,
+            )
+            holdout_epoch_metrics.pop("_movement_confusion", None)
+            ho_loss = holdout_epoch_metrics["val_loss"]
+            ho_move = holdout_epoch_metrics.get("val_movement_accuracy", 0.0)
+            epoch_metrics["holdout_loss"] = ho_loss
+            epoch_metrics["holdout_movement_accuracy"] = ho_move
+            epoch_bar.set_postfix_str(
+                f"train={train_loss:.4f} val={val_metrics['val_loss']:.4f} "
+                f"ho={ho_loss:.4f} ho_mv={ho_move:.3f} | {epoch_elapsed:.0f}s/ep"
+            )
+
         if scheduler is not None:
             scheduler.step()
-        if val_metrics["val_loss"] < best_val_loss:
-            best_val_loss = val_metrics["val_loss"]
+
+        # Pick tracking metric: holdout loss if configured, else val loss.
+        tracking_loss = epoch_metrics.get("holdout_loss", val_metrics["val_loss"]) \
+            if train_config.early_stop_on_holdout else val_metrics["val_loss"]
+        if tracking_loss < best_val_loss:
+            best_val_loss = tracking_loss
             best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
         if train_config.early_stop_patience > 0 and epochs_without_improvement >= train_config.early_stop_patience:
-            print(f"early_stop epoch={epoch:02d} best_val_loss={best_val_loss:.4f}")
+            tracking_name = "holdout_loss" if train_config.early_stop_on_holdout else "val_loss"
+            print(f"early_stop epoch={epoch:02d} best_{tracking_name}={best_val_loss:.4f}")
             break
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
 
     holdout_metrics: dict[str, float] = {}
     if holdout_dataset is not None:
-        holdout_loader = DataLoader(
-            holdout_dataset,
-            batch_size=train_config.batch_size,
-            shuffle=False,
-            num_workers=effective_workers,
-            persistent_workers=effective_workers > 0,
-            pin_memory=use_pin,
-            prefetch_factor=2 if effective_workers > 0 else None,
-        )
+        if holdout_loader is None:
+            holdout_loader = DataLoader(
+                holdout_dataset,
+                batch_size=train_config.batch_size,
+                shuffle=False,
+                num_workers=effective_workers,
+                persistent_workers=effective_workers > 0,
+                pin_memory=use_pin,
+                prefetch_factor=2 if effective_workers > 0 else None,
+            )
         holdout_metrics = _evaluate(
             model=model,
             loader=holdout_loader,
