@@ -25,37 +25,42 @@ from binding_rl_agent.models import IsaacCNNPolicy
 class TrainConfig:
     rollouts_dir: str = "rollouts"
     output_dir: str = "models"
-    epochs: int = 30
-    batch_size: int = 64
+    epochs: int = 100
+    batch_size: int = 128
     learning_rate: float = 1e-3
     train_fraction: float = 0.8
-    seed: int = 7
+    seed: int = 42
     num_workers: int = 0
     movement_idle_weight: float = 1.0
     movement_direction_weight: float = 1.0
     shooting_idle_weight: float = 1.0
-    early_stop_patience: int = 0
-    early_stop_on_holdout: bool = False  # use holdout loss instead of val loss for early stopping
+    early_stop_patience: int = 10
+    early_stop_on_holdout: bool = False  # legacy: use holdout loss for early stopping
     weight_decay: float = 1e-4
     augment: bool = True
     # Observation preprocessing
     frame_size: int = 128            # resize target (square)
     frame_mode: str = "gray"         # see FRAME_TRANSFORMS keys in preprocessing.py
     stack_size: int = 4              # number of frames stacked per observation
-    motion_channels: bool = False    # append frame-diff channels after stacking
-    # Model architecture
-    conv_channels: tuple[int, ...] = (8, 16, 16)
-    hidden_dim: int = 128
-    dropout: float = 0.0
+    motion_channels: bool = True     # append frame-diff channels after stacking
+    # Model architecture (best sweep config: IMPALA 4-stage, layer norm)
+    conv_channels: tuple[int, ...] = (32, 64, 64, 64)
+    hidden_dim: int = 512
+    dropout: float = 0.2
     use_batchnorm: bool = True
-    arch: str = "plain"               # "plain" | "impala" | "nature"
-    num_resblocks: int = 2            # only used when arch="impala"
-    norm_type: str | None = None      # None = derive from use_batchnorm; else "batch"|"layer"|"group"|"none"
-    aug_mode: str = "flip"            # "flip" | "flip+drq" | "flip+jitter" | "drq" | "jitter" | "none"
-    # Held-out run name (excluded from train+val; scored post-training).
-    holdout_run: str | None = None
+    arch: str = "impala"
+    num_resblocks: int = 2
+    norm_type: str = "layer"
+    aug_mode: str = "flip+jitter"
+    # Held-out run name used as the val set.  All other runs are used for
+    # training with no train/val split — validation is fully independent
+    # (separate gameplay session) and no training samples are wasted.
+    holdout_run: str | None = "run_20260413_160649"
     # None = auto-detect from dataset (use if nav_hints present), True/False = force
     use_nav_hint_embedding: bool | None = None
+    # Drop samples where movement=idle AND nav_hint!=STAY (human was thinking,
+    # not acting — teaches the model to freeze during navigation).
+    drop_idle_nav: bool = True
     # If True, only train and report movement head
     movement_only: bool = False
     # Limit number of runs loaded from rollouts_dir (None = all)
@@ -114,6 +119,7 @@ def train_behavior_cloning(config: TrainConfig | None = None) -> TrainResult:
         motion_channels=train_config.motion_channels,
         cache_dir=cache_dir,
         exclude_runs=exclude,
+        drop_idle_nav=train_config.drop_idle_nav,
     )
     if len(dataset) < 2:
         raise ValueError("Need at least 2 rollout samples to train and validate.")
@@ -131,16 +137,23 @@ def train_behavior_cloning(config: TrainConfig | None = None) -> TrainResult:
             include_runs=(train_config.holdout_run,),
         )
 
-    train_indices, val_indices = _temporal_train_val_split(
-        dataset,
-        train_fraction=train_config.train_fraction,
-        mode=train_config.val_split_mode,
-        seed=train_config.seed,
-    )
-    train_dataset = torch.utils.data.Subset(dataset, train_indices)
-    val_dataset = torch.utils.data.Subset(dataset, val_indices)
-    train_size = len(train_indices)
-    val_size = len(val_indices)
+    if holdout_dataset is not None:
+        # Holdout run is the val set; train on ALL other runs.
+        train_dataset = dataset
+        val_dataset = holdout_dataset
+        train_size = len(dataset)
+        val_size = len(holdout_dataset)
+    else:
+        train_indices, val_indices = _temporal_train_val_split(
+            dataset,
+            train_fraction=train_config.train_fraction,
+            mode=train_config.val_split_mode,
+            seed=train_config.seed,
+        )
+        train_dataset = torch.utils.data.Subset(dataset, train_indices)
+        val_dataset = torch.utils.data.Subset(dataset, val_indices)
+        train_size = len(train_indices)
+        val_size = len(val_indices)
 
     # With a memmap cache, __getitem__ is pure array indexing → workers are safe on Windows.
     # Without cache, bilateral filter runs per-sample on main process (num_workers=0).
@@ -220,9 +233,12 @@ def train_behavior_cloning(config: TrainConfig | None = None) -> TrainResult:
             optimizer, T_max=train_config.epochs, eta_min=train_config.learning_rate * 0.01
         )
 
-    # Build holdout loader up-front if we need it for per-epoch early stopping.
+    # Build a separate holdout loader only when holdout is NOT the val set
+    # and early_stop_on_holdout is requested (legacy path, no holdout_run).
     holdout_loader: DataLoader | None = None
-    if holdout_dataset is not None and train_config.early_stop_on_holdout:
+    if (holdout_dataset is not None
+            and train_config.early_stop_on_holdout
+            and holdout_dataset is not val_dataset):
         holdout_loader = DataLoader(
             holdout_dataset,
             batch_size=train_config.batch_size,
@@ -315,7 +331,15 @@ def train_behavior_cloning(config: TrainConfig | None = None) -> TrainResult:
         model.load_state_dict(best_model_state)
 
     holdout_metrics: dict[str, float] = {}
-    if holdout_dataset is not None:
+    if holdout_dataset is not None and holdout_dataset is val_dataset:
+        # Val set IS the holdout — reuse final val metrics, no redundant eval.
+        holdout_metrics = val_metrics
+        print(
+            f"[holdout = val] "
+            f"loss={holdout_metrics['val_loss']:.4f} "
+            f"move_acc={holdout_metrics.get('val_movement_accuracy', 0.0):.4f}"
+        )
+    elif holdout_dataset is not None:
         if holdout_loader is None:
             holdout_loader = DataLoader(
                 holdout_dataset,

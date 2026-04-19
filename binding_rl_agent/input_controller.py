@@ -24,6 +24,7 @@ KEY_OBJECTS: dict[str, str | Key] = {
 }
 
 FUNCTION_KEY_CODES: dict[str, int] = {
+    "f7": 0x76,
     "f8": 0x77,
     "f9": 0x78,
     "f10": 0x79,

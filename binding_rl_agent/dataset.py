@@ -122,6 +122,7 @@ class IsaacRolloutDataset(
         cache_dir: str | Path | None = None,
         exclude_runs: tuple[str, ...] = (),
         include_runs: tuple[str, ...] | None = None,
+        drop_idle_nav: bool = False,
     ) -> None:
         self.rollouts_dir = Path(rollouts_dir)
         self.stack_size = stack_size
@@ -145,6 +146,24 @@ class IsaacRolloutDataset(
             self.sample_to_run,
             self.sample_to_local,
         ) = self._load_rollouts(self.run_dirs, frame_size=frame_size)
+
+        # Drop idle-while-navigating samples: movement==idle AND nav_hint!=STAY.
+        # These are frames where the human was thinking, not acting — teaching
+        # the model to freeze up during navigation.
+        if drop_idle_nav and self.nav_hints is not None:
+            idle_nav_mask = (self.movement_actions == 0) & (self.nav_hints != 0)
+            keep_mask = ~idle_nav_mask
+            n_before = len(self.movement_actions)
+            keep_indices = np.where(keep_mask)[0]
+            self.movement_actions = self.movement_actions[keep_indices]
+            self.shooting_actions = self.shooting_actions[keep_indices]
+            self.bomb_actions = self.bomb_actions[keep_indices]
+            self.nav_hints = self.nav_hints[keep_indices]
+            self.sample_to_run = self.sample_to_run[keep_indices]
+            self.sample_to_local = self.sample_to_local[keep_indices]
+            n_dropped = n_before - len(self.movement_actions)
+            print(f"  [drop_idle_nav] Dropped {n_dropped}/{n_before} idle-while-navigating samples "
+                  f"({n_dropped / n_before * 100:.1f}%)")
 
         # Build or load pre-processed frame cache if requested.
         # Storing only paths+shapes keeps the dataset picklable for DataLoader workers.

@@ -29,8 +29,10 @@ def parse_args() -> argparse.Namespace:
                         help="Per-frame preprocessing mode.")
     parser.add_argument("--stack-size",  type=int, default=defaults.stack_size,
                         help="Number of frames stacked per observation.")
-    parser.add_argument("--motion-channels", action="store_true",
+    parser.add_argument("--motion-channels", action="store_true", default=defaults.motion_channels,
                         help="Append frame-diff channels after stacking.")
+    parser.add_argument("--no-motion-channels", action="store_true",
+                        help="Disable motion diff channels.")
     # Model architecture
     parser.add_argument("--conv-channels", type=int, nargs="+",
                         default=list(defaults.conv_channels))
@@ -44,11 +46,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-resblocks", type=int, default=defaults.num_resblocks)
     parser.add_argument("--aug-mode", choices=["flip", "flip+drq", "flip+jitter", "drq", "jitter", "none"],
                         default=defaults.aug_mode)
-    # Holdout / early stopping
-    parser.add_argument("--holdout-run", default=None,
-                        help="Run name to exclude from train/val and use as holdout")
-    parser.add_argument("--early-stop-on-holdout", action="store_true",
-                        help="Use holdout loss (not val loss) for early stopping")
+    # Holdout / validation
+    parser.add_argument("--holdout-run", default=defaults.holdout_run,
+                        help="Run name used as the val set (all other runs train).")
+    parser.add_argument("--no-holdout", action="store_true",
+                        help="Disable holdout; use random train/val split instead.")
     # Misc
     parser.add_argument("--movement-idle-weight",      type=float, default=defaults.movement_idle_weight)
     parser.add_argument("--movement-direction-weight", type=float, default=defaults.movement_direction_weight)
@@ -61,16 +63,20 @@ def parse_args() -> argparse.Namespace:
                         help="Label smoothing for all cross-entropy losses")
     parser.add_argument("--val-split-mode", choices=["random", "temporal"],
                         default=defaults.val_split_mode,
-                        help="random (default): mixed split preserving temporal distribution; "
-                             "temporal: first 80%% train / last 20%% val per run")
+                        help="Train/val split mode (only used when --no-holdout).")
     parser.add_argument("--cache-dir", default=defaults.cache_dir,
-                        help="Pre-processed frame cache directory ('' = disabled). "
-                             "Speeds up training by caching bilateral/colour transforms to disk.")
+                        help="Pre-processed frame cache directory ('' = disabled).")
+    parser.add_argument("--use-nav-hint", action="store_true",
+                        help="Enable nav-hint embedding input to the policy.")
+    parser.add_argument("--no-drop-idle-nav", action="store_true",
+                        help="Keep idle-while-navigating samples (dropped by default).")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    holdout = None if args.no_holdout else args.holdout_run
+    motion = False if args.no_motion_channels else args.motion_channels
     result = train_behavior_cloning(
         TrainConfig(
             rollouts_dir=args.rollouts_dir,
@@ -85,7 +91,7 @@ def main() -> None:
             frame_size=args.frame_size,
             frame_mode=args.frame_mode,
             stack_size=args.stack_size,
-            motion_channels=args.motion_channels,
+            motion_channels=motion,
             conv_channels=tuple(args.conv_channels),
             hidden_dim=args.hidden_dim,
             dropout=args.dropout,
@@ -94,8 +100,7 @@ def main() -> None:
             norm_type=args.norm_type,
             num_resblocks=args.num_resblocks,
             aug_mode=args.aug_mode,
-            holdout_run=args.holdout_run,
-            early_stop_on_holdout=args.early_stop_on_holdout,
+            holdout_run=holdout,
             movement_idle_weight=args.movement_idle_weight,
             movement_direction_weight=args.movement_direction_weight,
             shooting_idle_weight=args.shooting_idle_weight,
@@ -106,6 +111,8 @@ def main() -> None:
             label_smoothing=args.label_smoothing,
             val_split_mode=args.val_split_mode,
             cache_dir=args.cache_dir,
+            use_nav_hint_embedding=args.use_nav_hint,
+            drop_idle_nav=not args.no_drop_idle_nav,
         )
     )
     print(f"num_samples={result.num_samples}  model={result.model_path}")
