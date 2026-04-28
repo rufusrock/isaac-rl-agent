@@ -211,3 +211,5 @@ class IsaacCNNPolicy(nn.Module):
             "shooting": self.shooting_head(hidden),
             "bomb": self.bomb_head(hidden),
         }
+
+

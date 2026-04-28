@@ -122,7 +122,7 @@ class IsaacRolloutDataset(
         cache_dir: str | Path | None = None,
         exclude_runs: tuple[str, ...] = (),
         include_runs: tuple[str, ...] | None = None,
-        drop_idle_nav: bool = False,
+        dagger_human_only: bool = True,
     ) -> None:
         self.rollouts_dir = Path(rollouts_dir)
         self.stack_size = stack_size
@@ -145,25 +145,9 @@ class IsaacRolloutDataset(
             self.nav_hints,
             self.sample_to_run,
             self.sample_to_local,
-        ) = self._load_rollouts(self.run_dirs, frame_size=frame_size)
-
-        # Drop idle-while-navigating samples: movement==idle AND nav_hint!=STAY.
-        # These are frames where the human was thinking, not acting — teaching
-        # the model to freeze up during navigation.
-        if drop_idle_nav and self.nav_hints is not None:
-            idle_nav_mask = (self.movement_actions == 0) & (self.nav_hints != 0)
-            keep_mask = ~idle_nav_mask
-            n_before = len(self.movement_actions)
-            keep_indices = np.where(keep_mask)[0]
-            self.movement_actions = self.movement_actions[keep_indices]
-            self.shooting_actions = self.shooting_actions[keep_indices]
-            self.bomb_actions = self.bomb_actions[keep_indices]
-            self.nav_hints = self.nav_hints[keep_indices]
-            self.sample_to_run = self.sample_to_run[keep_indices]
-            self.sample_to_local = self.sample_to_local[keep_indices]
-            n_dropped = n_before - len(self.movement_actions)
-            print(f"  [drop_idle_nav] Dropped {n_dropped}/{n_before} idle-while-navigating samples "
-                  f"({n_dropped / n_before * 100:.1f}%)")
+        ) = self._load_rollouts(
+            self.run_dirs, frame_size=frame_size, dagger_human_only=dagger_human_only,
+        )
 
         # Build or load pre-processed frame cache if requested.
         # Storing only paths+shapes keeps the dataset picklable for DataLoader workers.
@@ -306,6 +290,7 @@ class IsaacRolloutDataset(
     def _load_rollouts(
         run_dirs: list[Path],
         frame_size: int = 128,
+        dagger_human_only: bool = True,
     ) -> tuple[
         list[np.ndarray],   # raw_frames_per_run
         np.ndarray,         # movement_actions
@@ -351,18 +336,41 @@ class IsaacRolloutDataset(
                     "Please re-record rollouts."
                 )
 
+            # DAgger filter: only keep frames where movement was human-corrected.
+            # Model-source frames record the model's own (often frozen) prediction
+            # as if it were the right answer, which contradicts human corrections
+            # in similar states and biases the retrained model toward idle.
+            keep_mask: np.ndarray | None = None
+            if "action_sources" in data and dagger_human_only:
+                sources = data["action_sources"]  # (N, 3): mv_src, sh_src, bomb_src
+                keep_mask = sources[:, 0] == 1  # SRC_HUMAN
+                kept = int(keep_mask.sum())
+                print(
+                    f"  [dagger filter] {run_dir.name}: kept {kept}/{len(keep_mask)} "
+                    f"human-corrected movement frames"
+                )
+                movement_actions = movement_actions[keep_mask]
+                shooting_actions = shooting_actions[keep_mask]
+                bomb_actions = bomb_actions[keep_mask]
+                local_indices = np.where(keep_mask)[0].astype(np.int32)
+            else:
+                local_indices = np.arange(n_actions, dtype=np.int32)
+
             raw_frames_per_run.append(raw)
             movement_list.append(movement_actions)
             shooting_list.append(shooting_actions)
             bomb_list.append(bomb_actions)
-            sample_to_run_list.append(np.full(n_actions, run_idx, dtype=np.int32))
-            sample_to_local_list.append(np.arange(n_actions, dtype=np.int32))
+            sample_to_run_list.append(np.full(len(local_indices), run_idx, dtype=np.int32))
+            sample_to_local_list.append(local_indices)
 
             if "nav_hints" in data:
-                nav_hints_list.append(data["nav_hints"].astype(np.int64, copy=False))
+                nav_hints = data["nav_hints"].astype(np.int64, copy=False)
+                if keep_mask is not None:
+                    nav_hints = nav_hints[keep_mask]
+                nav_hints_list.append(nav_hints)
                 any_nav_hints = True
             else:
-                nav_hints_list.append(np.zeros(n_actions, dtype=np.int64))
+                nav_hints_list.append(np.zeros(len(local_indices), dtype=np.int64))
 
         movement = np.concatenate(movement_list).astype(np.int64, copy=False)
         shooting = np.concatenate(shooting_list).astype(np.int64, copy=False)

@@ -23,6 +23,12 @@ from binding_rl_agent.models import IsaacCNNPolicy
 
 @dataclass(frozen=True)
 class TrainConfig:
+    """Training config for the BC pipeline.
+
+    All fields are baked to the values that produced the working DAgger-trained
+    flat-CNN models.  Override programmatically if you need to experiment; the
+    CLI deliberately exposes nothing.
+    """
     rollouts_dir: str = "rollouts"
     output_dir: str = "models"
     epochs: int = 100
@@ -35,15 +41,14 @@ class TrainConfig:
     movement_direction_weight: float = 1.0
     shooting_idle_weight: float = 1.0
     early_stop_patience: int = 10
-    early_stop_on_holdout: bool = False  # legacy: use holdout loss for early stopping
     weight_decay: float = 1e-4
     augment: bool = True
     # Observation preprocessing
-    frame_size: int = 128            # resize target (square)
-    frame_mode: str = "gray"         # see FRAME_TRANSFORMS keys in preprocessing.py
-    stack_size: int = 4              # number of frames stacked per observation
-    motion_channels: bool = True     # append frame-diff channels after stacking
-    # Model architecture (best sweep config: IMPALA 4-stage, layer norm)
+    frame_size: int = 128
+    frame_mode: str = "gray"
+    stack_size: int = 4
+    motion_channels: bool = True
+    # Model architecture
     conv_channels: tuple[int, ...] = (32, 64, 64, 64)
     hidden_dim: int = 512
     dropout: float = 0.2
@@ -52,35 +57,21 @@ class TrainConfig:
     num_resblocks: int = 2
     norm_type: str = "layer"
     aug_mode: str = "flip+jitter"
-    # Held-out run name used as the val set.  All other runs are used for
-    # training with no train/val split — validation is fully independent
-    # (separate gameplay session) and no training samples are wasted.
+    # Held-out run used as the val set.  All other runs are used for training.
     holdout_run: str | None = "run_20260413_160649"
-    # None = auto-detect from dataset (use if nav_hints present), True/False = force
-    use_nav_hint_embedding: bool | None = None
-    # Drop samples where movement=idle AND nav_hint!=STAY (human was thinking,
-    # not acting — teaches the model to freeze during navigation).
-    drop_idle_nav: bool = True
-    # If True, only train and report movement head
+    use_nav_hint_embedding: bool = True
+    # For dagger_* runs only: keep only frames where movement was human-corrected.
+    # Otherwise the model's own freeze frames get baked back in as labels,
+    # creating contradictory signal vs. the human corrections.
+    dagger_human_only: bool = True
     movement_only: bool = False
-    # Limit number of runs loaded from rollouts_dir (None = all)
     max_runs: int | None = None
-    # LR scheduler: "none" | "cosine"
-    lr_scheduler: str = "none"
-    # Label smoothing for all cross-entropy losses
+    lr_scheduler: str = "cosine"
     label_smoothing: float = 0.05
-    # Pre-process frame cache directory ("" = disabled).
-    # When set, bilateral/colour transforms run once and are stored as memmaps;
-    # __getitem__ becomes pure array indexing → enables num_workers > 0 on Windows.
-    cache_dir: str = ""
-    # Train/val split mode within each run.
-    # "random": randomly assign samples — train and val share the same temporal
-    #            distribution.  Frame-stack leakage is minimal and acceptable.
-    #            This is the historical default and what produced the 0.786 model.
-    # "temporal": first train_fraction of each run → train, remainder → val.
-    #             Creates early-game/late-game distribution shift that prevents
-    #             generalisation.  Only use when you explicitly need future-frame
-    #             holdout (e.g. online evaluation).
+    # Memmap frame cache.  __getitem__ becomes pure array indexing, which
+    # enables num_workers > 0 on Windows and pushes GPU utilisation up.
+    cache_dir: str = "rollouts/cache"
+    # Random within-run train/val split when no holdout_run is set.
     val_split_mode: str = "random"
 
 
@@ -119,7 +110,7 @@ def train_behavior_cloning(config: TrainConfig | None = None) -> TrainResult:
         motion_channels=train_config.motion_channels,
         cache_dir=cache_dir,
         exclude_runs=exclude,
-        drop_idle_nav=train_config.drop_idle_nav,
+        dagger_human_only=train_config.dagger_human_only,
     )
     if len(dataset) < 2:
         raise ValueError("Need at least 2 rollout samples to train and validate.")
@@ -182,10 +173,8 @@ def train_behavior_cloning(config: TrainConfig | None = None) -> TrainResult:
 
     sample_observation, _ = dataset[0]
     input_channels = int(sample_observation.shape[0])
-    if train_config.use_nav_hint_embedding is None:
-        use_nav_hint_embedding = dataset.summary.has_nav_hints
-    else:
-        use_nav_hint_embedding = train_config.use_nav_hint_embedding
+    use_nav_hint_embedding = train_config.use_nav_hint_embedding
+
     model = IsaacCNNPolicy(
         input_channels=input_channels,
         conv_channels=train_config.conv_channels,
@@ -233,22 +222,6 @@ def train_behavior_cloning(config: TrainConfig | None = None) -> TrainResult:
             optimizer, T_max=train_config.epochs, eta_min=train_config.learning_rate * 0.01
         )
 
-    # Build a separate holdout loader only when holdout is NOT the val set
-    # and early_stop_on_holdout is requested (legacy path, no holdout_run).
-    holdout_loader: DataLoader | None = None
-    if (holdout_dataset is not None
-            and train_config.early_stop_on_holdout
-            and holdout_dataset is not val_dataset):
-        holdout_loader = DataLoader(
-            holdout_dataset,
-            batch_size=train_config.batch_size,
-            shuffle=False,
-            num_workers=effective_workers,
-            persistent_workers=effective_workers > 0,
-            pin_memory=use_pin,
-            prefetch_factor=2 if effective_workers > 0 else None,
-        )
-
     history: list[dict[str, float]] = []
     best_val_loss = float("inf")
     best_model_state: dict | None = None
@@ -292,40 +265,18 @@ def train_behavior_cloning(config: TrainConfig | None = None) -> TrainResult:
         epoch_bar.set_postfix_str(
             f"train={train_loss:.4f} val={val_metrics['val_loss']:.4f} | {acc_str} | {epoch_elapsed:.0f}s/ep"
         )
-        # Per-epoch holdout eval for early stopping when configured.
-        if holdout_loader is not None:
-            holdout_epoch_metrics = _evaluate(
-                model=model,
-                loader=holdout_loader,
-                criteria=criteria,
-                device=device,
-                loss_weights=loss_weights,
-            )
-            holdout_epoch_metrics.pop("_movement_confusion", None)
-            ho_loss = holdout_epoch_metrics["val_loss"]
-            ho_move = holdout_epoch_metrics.get("val_movement_accuracy", 0.0)
-            epoch_metrics["holdout_loss"] = ho_loss
-            epoch_metrics["holdout_movement_accuracy"] = ho_move
-            epoch_bar.set_postfix_str(
-                f"train={train_loss:.4f} val={val_metrics['val_loss']:.4f} "
-                f"ho={ho_loss:.4f} ho_mv={ho_move:.3f} | {epoch_elapsed:.0f}s/ep"
-            )
 
         if scheduler is not None:
             scheduler.step()
 
-        # Pick tracking metric: holdout loss if configured, else val loss.
-        tracking_loss = epoch_metrics.get("holdout_loss", val_metrics["val_loss"]) \
-            if train_config.early_stop_on_holdout else val_metrics["val_loss"]
-        if tracking_loss < best_val_loss:
-            best_val_loss = tracking_loss
+        if val_metrics["val_loss"] < best_val_loss:
+            best_val_loss = val_metrics["val_loss"]
             best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
         if train_config.early_stop_patience > 0 and epochs_without_improvement >= train_config.early_stop_patience:
-            tracking_name = "holdout_loss" if train_config.early_stop_on_holdout else "val_loss"
-            print(f"early_stop epoch={epoch:02d} best_{tracking_name}={best_val_loss:.4f}")
+            print(f"early_stop epoch={epoch:02d} best_val_loss={best_val_loss:.4f}")
             break
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
@@ -340,16 +291,15 @@ def train_behavior_cloning(config: TrainConfig | None = None) -> TrainResult:
             f"move_acc={holdout_metrics.get('val_movement_accuracy', 0.0):.4f}"
         )
     elif holdout_dataset is not None:
-        if holdout_loader is None:
-            holdout_loader = DataLoader(
-                holdout_dataset,
-                batch_size=train_config.batch_size,
-                shuffle=False,
-                num_workers=effective_workers,
-                persistent_workers=effective_workers > 0,
-                pin_memory=use_pin,
-                prefetch_factor=2 if effective_workers > 0 else None,
-            )
+        holdout_loader = DataLoader(
+            holdout_dataset,
+            batch_size=train_config.batch_size,
+            shuffle=False,
+            num_workers=effective_workers,
+            persistent_workers=effective_workers > 0,
+            pin_memory=use_pin,
+            prefetch_factor=2 if effective_workers > 0 else None,
+        )
         holdout_metrics = _evaluate(
             model=model,
             loader=holdout_loader,
@@ -372,19 +322,17 @@ def train_behavior_cloning(config: TrainConfig | None = None) -> TrainResult:
     model_path = run_dir / "bc_policy.pt"
     metrics_path = run_dir / "metrics.json"
 
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "input_channels": int(sample_observation.shape[0]),
-            "movement_names": MOVEMENT_NAMES,
-            "shooting_names": SHOOTING_NAMES,
-            "bomb_names": BOMB_NAMES,
-            "train_config": asdict(train_config),
-            "dataset_summary": asdict(dataset.summary),
-            "use_nav_hint_embedding": use_nav_hint_embedding,
-        },
-        model_path,
-    )
+    checkpoint_data = {
+        "model_state_dict": model.state_dict(),
+        "input_channels": input_channels,
+        "movement_names": MOVEMENT_NAMES,
+        "shooting_names": SHOOTING_NAMES,
+        "bomb_names": BOMB_NAMES,
+        "train_config": asdict(train_config),
+        "dataset_summary": asdict(dataset.summary),
+        "use_nav_hint_embedding": use_nav_hint_embedding,
+    }
+    torch.save(checkpoint_data, model_path)
 
     # Convert confusion matrix from list-of-lists to dict-of-dicts keyed by
     # class name for readability in metrics.json.
@@ -578,6 +526,7 @@ def _run_epoch(
             optimizer.zero_grad()
 
         logits = model(observations, nav_hint=nav_hint_input)
+
         _w = loss_weights or {}
         loss = sum(
             _w.get(name, 1.0) * criteria[name](logits[name], targets[name])
@@ -590,7 +539,7 @@ def _run_epoch(
 
         batch_size = observations.shape[0]
         total_loss += float(loss.item()) * batch_size
-        total_items += int(batch_size)
+        total_items += batch_size
         batch_bar.set_postfix_str(f"loss={total_loss / max(total_items, 1):.4f}")
 
     return total_loss / max(total_items, 1)
@@ -630,6 +579,7 @@ def _evaluate(
             targets = {name: all_targets[name] for name in criteria if name in all_targets}
 
             logits = model(observations, nav_hint=nav_hint_input)
+
             loss = sum(
                 _w.get(name, 1.0) * criteria[name](logits[name], targets[name])
                 for name in criteria
@@ -637,17 +587,16 @@ def _evaluate(
 
             batch_size = observations.shape[0]
             total_loss += float(loss.item()) * batch_size
-            total_items += int(batch_size)
+            total_items += batch_size
 
             for name in criteria:
                 preds = torch.argmax(logits[name], dim=1)
                 total_correct[name] += int((preds == targets[name]).sum().item())
 
                 if name == "movement":
-                    # Compute entropy of movement softmax distribution
-                    probs = torch.softmax(logits["movement"], dim=1)  # (B, 5)
+                    probs = torch.softmax(logits["movement"], dim=1)
                     log_probs = torch.log(probs + 1e-8)
-                    entropy = -(probs * log_probs).sum(dim=1)  # (B,)
+                    entropy = -(probs * log_probs).sum(dim=1)
                     total_movement_entropy += float(entropy.sum().item())
 
                     true_np = targets[name].cpu().numpy()

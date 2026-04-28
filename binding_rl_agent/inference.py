@@ -43,7 +43,9 @@ def find_latest_model(models_dir: str | Path = "models") -> Path:
     return candidates[0] / "bc_policy.pt"
 
 
-def load_policy_checkpoint(model_path: str | Path) -> tuple[IsaacCNNPolicy, torch.device, dict]:
+def load_policy_checkpoint(
+    model_path: str | Path,
+) -> tuple[IsaacCNNPolicy, torch.device, dict]:
     checkpoint_path = Path(model_path)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     try:
@@ -57,7 +59,6 @@ def load_policy_checkpoint(model_path: str | Path) -> tuple[IsaacCNNPolicy, torc
     frame_size = int(train_cfg.get("frame_size", 128))
 
     # Derive input_channels from train_config when not explicitly stored at top level.
-    # Older checkpoints stored it directly; newer ones only store it in train_config.
     if "input_channels" in checkpoint:
         input_channels = int(checkpoint["input_channels"])
     else:
@@ -75,7 +76,8 @@ def load_policy_checkpoint(model_path: str | Path) -> tuple[IsaacCNNPolicy, torc
     norm_type = train_cfg.get("norm_type", None)
     num_resblocks = int(train_cfg.get("num_resblocks", 2))
     dropout = float(train_cfg.get("dropout", 0.0))
-    model = IsaacCNNPolicy(
+
+    common_kwargs = dict(
         input_channels=input_channels,
         input_size=frame_size,
         num_movement_actions=len(checkpoint.get("movement_names", MOVEMENT_NAMES)),
@@ -89,9 +91,10 @@ def load_policy_checkpoint(model_path: str | Path) -> tuple[IsaacCNNPolicy, torc
         num_resblocks=num_resblocks,
         dropout=dropout,
     )
+
+    model = IsaacCNNPolicy(**common_kwargs)
+
     state_dict = checkpoint["model_state_dict"]
-    # Old checkpoints may contain BatchNorm weights that no longer exist in the
-    # model.  Load with strict=False and warn about unexpected keys.
     result = model.load_state_dict(state_dict, strict=False)
     if result.unexpected_keys:
         import warnings
@@ -129,19 +132,14 @@ def predict_policy(
 ) -> PolicyPrediction:
     """Run a forward pass and return structured predictions.
 
-    Parameters
-    ----------
-    nav_hint:
-        Integer nav hint class (0=STAY, 1=N, 2=S, 3=W, 4=E) for the current
-        timestep.  Required when the model was trained with
-        ``use_nav_hint_embedding=True``; if omitted the model falls back to
-        STAY (class 0) via its own forward-pass default.
+    nav_hint is an integer class (0=STAY, 1=N, 2=S, 3=W, 4=E) — required when
+    the model was trained with ``use_nav_hint_embedding=True``; if omitted the
+    model falls back to STAY (class 0).
     """
     obs_f = torch.from_numpy(observation).float() / 255.0
-    # Append motion (frame-diff) channels if the model expects them.
     train_cfg = checkpoint.get("train_config", {}) if checkpoint else {}
     if train_cfg.get("motion_channels", False) and obs_f.shape[0] > 1:
-        stack_size = obs_f.shape[0]  # C dimension = stack_size for gray
+        stack_size = obs_f.shape[0]
         diffs = [
             (obs_f[t:t + 1] - obs_f[t - 1:t]).abs()
             for t in range(1, stack_size)
@@ -181,7 +179,10 @@ def nav_hint_from_room_graph(
     return int(room_graph.nav_hint(current_room_index))
 
 
-def _decode_head(logits: torch.Tensor, label_map: dict[int, str]) -> HeadPrediction:
+def _decode_head(
+    logits: torch.Tensor,
+    label_map: dict[int, str],
+) -> HeadPrediction:
     probabilities = torch.softmax(logits[0], dim=0)
     index = int(torch.argmax(probabilities).item())
     confidence = float(probabilities[index].item())

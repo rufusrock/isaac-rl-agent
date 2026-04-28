@@ -69,14 +69,6 @@ _BOMB_VK: int = 0x45  # 'E'
 _KEY_TO_MOVEMENT: dict[str, int] = {"w": 1, "s": 2, "a": 3, "d": 4}
 _KEY_TO_SHOOTING: dict[str, int] = {"up": 1, "down": 2, "left": 3, "right": 4}
 
-# Reverse: movement/shooting index -> set of key names used by model
-_MOVEMENT_KEYS: dict[int, set[str]] = {
-    idx: set(MOVEMENT_KEY_MAP[idx]) for idx in MOVEMENT_KEY_MAP
-}
-_SHOOTING_KEYS: dict[int, set[str]] = {
-    idx: set(SHOOTING_KEY_MAP[idx]) for idx in SHOOTING_KEY_MAP
-}
-
 # Source codes for action_sources array
 SRC_MODEL = 0
 SRC_HUMAN = 1
@@ -90,29 +82,35 @@ def _is_pressed(vk: int) -> bool:
     return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
 
 
-def _detect_human_movement(model_movement_idx: int) -> tuple[int, int]:
-    """Detect human movement key presses, accounting for model's simulated keys.
+def _detect_human_movement(
+    model_movement_idx: int,
+    synced_keys: set[str],
+) -> tuple[int, int]:
+    """Detect human movement key presses.
 
-    Returns (movement_action, source) where source is SRC_MODEL or SRC_HUMAN.
+    ``synced_keys`` is the set of movement keys we asked the OS to hold at the
+    end of the previous frame (from ``active_agent_keys``).  Comparing against
+    that — rather than the *current* model action's keys — avoids false-positive
+    human detection when the model changes direction between frames (the keys
+    from the previous frame are still physically pressed at detection time).
     """
-    model_keys = _MOVEMENT_KEYS.get(model_movement_idx, set())
     pressed = {k for k, vk in _MOVEMENT_VK.items() if _is_pressed(vk)}
-    human_only = pressed - model_keys
+    human_only = pressed - synced_keys
 
     if human_only:
-        # Human is pressing a movement key the model isn't -> override
-        # Pick the first one (in priority order: WASD)
         for key in ("w", "s", "a", "d"):
             if key in human_only:
                 return _KEY_TO_MOVEMENT[key], SRC_HUMAN
     return model_movement_idx, SRC_MODEL
 
 
-def _detect_human_shooting(model_shooting_idx: int) -> tuple[int, int]:
-    """Detect human shooting key presses, accounting for model's simulated keys."""
-    model_keys = _SHOOTING_KEYS.get(model_shooting_idx, set())
+def _detect_human_shooting(
+    model_shooting_idx: int,
+    synced_keys: set[str],
+) -> tuple[int, int]:
+    """Detect human shooting key presses. See ``_detect_human_movement``."""
     pressed = {k for k, vk in _SHOOTING_VK.items() if _is_pressed(vk)}
-    human_only = pressed - model_keys
+    human_only = pressed - synced_keys
 
     if human_only:
         for key in ("up", "down", "left", "right"):
@@ -152,25 +150,20 @@ def _capture_for_recording(raw_bgr: np.ndarray) -> np.ndarray:
 # Main
 # ---------------------------------------------------------------------------
 
+FPS = 20
+WARMUP_SECONDS = 5.0
+OUTPUT_DIR = "rollouts"
+TELEMETRY_PORT = 8123
+PREVIEW_SCALE = 4
+BOMB_THRESHOLD = 0.95
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="DAgger collection: model plays, human corrects.",
     )
-    parser.add_argument("--model-path", default=None)
-    parser.add_argument("--title", default=None,
-                        help="Game window title substring.")
-    parser.add_argument("--output-dir", default="rollouts",
-                        help="Directory to save DAgger rollouts.")
-    parser.add_argument("--fps", type=int, default=10,
-                        help="Control / recording FPS.")
-    parser.add_argument("--movement-threshold", type=float, default=0.0)
-    parser.add_argument("--shooting-threshold", type=float, default=0.0)
-    parser.add_argument("--bomb-threshold", type=float, default=0.95)
-    parser.add_argument("--preview-scale", type=int, default=4)
-    parser.add_argument("--warmup", type=float, default=5.0)
-    parser.add_argument("--telemetry-port", type=int, default=8123)
-    parser.add_argument("--force-non-idle", action="store_true",
-                        help="When model predicts idle, use best non-idle instead.")
+    parser.add_argument("--model-path", default=None,
+                        help="Checkpoint path.  Defaults to the latest model.")
     return parser.parse_args()
 
 
@@ -185,7 +178,7 @@ def main() -> None:
 
     obs_kwargs = obs_config_from_checkpoint(checkpoint)
     env = IsaacFrameEnv(
-        title_substring=args.title,
+        title_substring=None,
         observation_config=ObservationConfig(
             width=checkpoint_frame_size,
             height=checkpoint_frame_size,
@@ -197,7 +190,7 @@ def main() -> None:
     telemetry: IsaacUDPGameStateReceiver | None = None
     if use_nav_hint:
         try:
-            telemetry = IsaacUDPGameStateReceiver(port=args.telemetry_port)
+            telemetry = IsaacUDPGameStateReceiver(port=TELEMETRY_PORT)
         except OSError as exc:
             print(f"[WARN] Could not bind telemetry: {exc}")
 
@@ -242,11 +235,10 @@ def main() -> None:
     print("  q:   quit preview")
     print()
 
-    warmup_until = time.monotonic() + args.warmup
-    if args.warmup > 0:
-        print(f"Warmup: {args.warmup:.0f}s ...")
+    warmup_until = time.monotonic() + WARMUP_SECONDS
+    print(f"Warmup: {WARMUP_SECONDS:.0f}s ...")
 
-    frame_delay = 1.0 / max(args.fps, 1)
+    frame_delay = 1.0 / FPS
     next_tick = time.monotonic()
 
     try:
@@ -313,12 +305,8 @@ def main() -> None:
             )
             model_action = prediction_to_action(
                 prediction,
-                movement_threshold=args.movement_threshold,
-                shooting_threshold=args.shooting_threshold,
-                bomb_threshold=args.bomb_threshold,
+                bomb_threshold=BOMB_THRESHOLD,
             )
-            if args.force_non_idle:
-                model_action = _force_non_idle(model_action, prediction)
 
             # --- Determine final action ---
             if human_mode:
@@ -331,9 +319,13 @@ def main() -> None:
                 sh_src = SRC_HUMAN
                 bomb_src = SRC_HUMAN
             else:
-                # MODEL mode: model plays, human overrides by pressing different keys
-                final_movement, mv_src = _detect_human_movement(model_action.movement)
-                final_shooting, sh_src = _detect_human_shooting(model_action.shooting)
+                # MODEL mode: model plays, human overrides by pressing different keys.
+                # Compare physical state against keys we synced last frame (which is
+                # what's still physically pressed at the start of this frame).
+                synced_movement = active_agent_keys & set(_MOVEMENT_VK.keys())
+                synced_shooting = active_agent_keys & set(_SHOOTING_VK.keys())
+                final_movement, mv_src = _detect_human_movement(model_action.movement, synced_movement)
+                final_shooting, sh_src = _detect_human_shooting(model_action.shooting, synced_shooting)
                 final_bomb = model_action.bomb
                 bomb_src = SRC_MODEL
                 # Check human bomb press independently
@@ -362,14 +354,20 @@ def main() -> None:
                     # Human's physical presses go directly to the game.
                     active_agent_keys = sync_pressed_keys([], active_agent_keys)
                 else:
-                    # In model mode, simulate the final action keys.
-                    desired = (
-                        MOVEMENT_KEY_MAP[final_action.movement]
-                        + SHOOTING_KEY_MAP[final_action.shooting]
-                    )
+                    # In model mode: only sync keys for heads the model is
+                    # driving.  When a head is human-overridden, leave its
+                    # keys un-synced — the human's physical press drives the
+                    # game directly, avoiding key-cancellation when model and
+                    # human disagree.  Releasing the previously-synced model
+                    # keys still happens implicitly via sync_pressed_keys.
+                    desired: list[str] = []
+                    if mv_src == SRC_MODEL:
+                        desired += MOVEMENT_KEY_MAP[final_action.movement]
+                    if sh_src == SRC_MODEL:
+                        desired += SHOOTING_KEY_MAP[final_action.shooting]
                     active_agent_keys = sync_pressed_keys(desired, active_agent_keys)
 
-                # Bomb tap
+                # Bomb is a tap, not a hold — no cancellation issue.
                 if final_action.bomb == 1 and previous_bomb == 0:
                     for k in BOMB_KEY_MAP[1]:
                         tap_key(k, hold_seconds=0.05)
@@ -401,13 +399,11 @@ def main() -> None:
 
             # --- Preview ---
             preview = cv2.cvtColor(observation[-1], cv2.COLOR_GRAY2BGR)
-            if args.preview_scale != 1:
-                preview = cv2.resize(
-                    preview,
-                    (preview.shape[1] * args.preview_scale,
-                     preview.shape[0] * args.preview_scale),
-                    interpolation=cv2.INTER_NEAREST,
-                )
+            preview = cv2.resize(
+                preview,
+                (preview.shape[1] * PREVIEW_SCALE, preview.shape[0] * PREVIEW_SCALE),
+                interpolation=cv2.INTER_NEAREST,
+            )
             _draw_overlay(
                 preview,
                 model_path=model_path,
@@ -442,7 +438,7 @@ def main() -> None:
         return
 
     _save_rollout(
-        output_dir=args.output_dir,
+        output_dir=OUTPUT_DIR,
         raw_frames=raw_frames,
         movement_actions=movement_actions,
         shooting_actions=shooting_actions,
@@ -454,7 +450,7 @@ def main() -> None:
         model_path=model_path,
         total_steps=total_steps,
         human_steps=human_steps,
-        fps=args.fps,
+        fps=FPS,
     )
 
 
@@ -601,26 +597,6 @@ def _nav_hint_label(nav_hint: int) -> str:
         int(NavHint.WEST): "WEST",
         int(NavHint.EAST): "EAST",
     }.get(nav_hint, f"?({nav_hint})")
-
-
-def _force_non_idle(action: IsaacAction, prediction) -> IsaacAction:
-    movement = action.movement
-    shooting = action.shooting
-    if prediction.movement.index == 0:
-        movement = _best_non_idle(prediction.movement.probabilities)
-    if prediction.shooting.index == 0:
-        shooting = _best_non_idle(prediction.shooting.probabilities)
-    return IsaacAction(movement=movement, shooting=shooting, bomb=action.bomb)
-
-
-def _best_non_idle(probs: tuple[float, ...]) -> int:
-    if len(probs) <= 1:
-        return 0
-    best_i, best_p = 1, probs[1]
-    for i in range(2, len(probs)):
-        if probs[i] > best_p:
-            best_i, best_p = i, probs[i]
-    return best_i
 
 
 if __name__ == "__main__":
