@@ -71,6 +71,16 @@ class IsaacUDPGameStateReceiver:
             pass
         return self.parse(self.last_payload)
 
+    def drain(self) -> IsaacGameState | None:
+        """Read all queued UDP packets and return the most recent parsed state."""
+        while True:
+            try:
+                data, _ = self.sock.recvfrom(4096)
+                self.last_payload = data.decode()
+            except BlockingIOError:
+                break
+        return self.parse(self.last_payload)
+
     @staticmethod
     def parse(payload: str | None) -> IsaacGameState | None:
         if not payload:

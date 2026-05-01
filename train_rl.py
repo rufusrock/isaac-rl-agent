@@ -20,28 +20,81 @@ def parse_args() -> argparse.Namespace:
         default=5.0,
         help="How long to wait before starting live RL.",
     )
-    parser.add_argument("--updates", type=int, default=defaults.total_updates, help="Number of RL updates.")
-    parser.add_argument("--rollout-steps", type=int, default=defaults.rollout_steps, help="Steps per update.")
-    parser.add_argument("--ppo-epochs", type=int, default=defaults.ppo_epochs, help="PPO epochs per rollout batch.")
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=defaults.total_episodes,
+        help="Number of episodes (one PPO update per episode).",
+    )
+    parser.add_argument(
+        "--max-steps-per-episode",
+        type=int,
+        default=defaults.max_steps_per_episode,
+        help="Safety cap on steps before forcing an episode end.",
+    )
+    parser.add_argument("--ppo-epochs", type=int, default=defaults.ppo_epochs, help="PPO epochs per episode.")
     parser.add_argument(
         "--ppo-minibatch-size",
         type=int,
-        default=32,
-        help="PPO minibatch size within each rollout batch.",
+        default=defaults.ppo_minibatch_size,
+        help="PPO minibatch size within the episode buffer.",
     )
     parser.add_argument(
         "--ppo-clip-epsilon",
         type=float,
-        default=0.2,
+        default=defaults.ppo_clip_epsilon,
         help="PPO clipped-surrogate epsilon.",
     )
-    parser.add_argument("--learning-rate", type=float, default=5.0e-5, help="Adam learning rate.")
+    parser.add_argument("--learning-rate", type=float, default=defaults.learning_rate, help="Adam learning rate.")
     parser.add_argument("--gamma", type=float, default=defaults.gamma, help="Discount factor.")
     parser.add_argument(
         "--entropy-coef",
         type=float,
         default=defaults.entropy_coef,
         help="Entropy regularization coefficient.",
+    )
+    parser.add_argument(
+        "--movement-sampling-temperature",
+        type=float,
+        default=defaults.movement_sampling_temperature,
+        help="Temperature applied to movement logits (lower = closer to argmax).",
+    )
+    parser.add_argument(
+        "--shooting-sampling-temperature",
+        type=float,
+        default=defaults.shooting_sampling_temperature,
+        help="Temperature applied to shooting logits (1.0 = BC's natural distribution).",
+    )
+    parser.add_argument(
+        "--bomb-sampling-temperature",
+        type=float,
+        default=defaults.bomb_sampling_temperature,
+        help="Temperature applied to bomb logits (ignored when --enable-bomb is not set).",
+    )
+    parser.add_argument(
+        "--enable-bomb",
+        dest="disable_bomb",
+        action="store_false",
+        help="Allow the agent to take bomb actions (default: bomb is forced to 0).",
+    )
+    parser.set_defaults(disable_bomb=defaults.disable_bomb)
+    parser.add_argument(
+        "--target-kl",
+        type=float,
+        default=defaults.target_kl,
+        help="Target KL between behavior and current policy (per minibatch).",
+    )
+    parser.add_argument(
+        "--min-learning-rate",
+        type=float,
+        default=defaults.min_learning_rate,
+        help="Floor for adaptive LR scaling.",
+    )
+    parser.add_argument(
+        "--max-learning-rate",
+        type=float,
+        default=defaults.max_learning_rate,
+        help="Ceiling for adaptive LR scaling.",
     )
     parser.add_argument("--output-dir", default="rl_runs", help="Directory for RL checkpoints/logs.")
     parser.add_argument(
@@ -68,62 +121,10 @@ def parse_args() -> argparse.Namespace:
         help="Try to restart the game automatically after death.",
     )
     parser.add_argument(
-        "--deterministic-actions",
-        action="store_true",
-        help="Use argmax action selection instead of stochastic sampling.",
-    )
-    parser.add_argument(
-        "--no-adaptive-exploration",
-        action="store_true",
-        help="Disable extra exploration when the agent has been stagnant for a while.",
-    )
-    parser.add_argument(
-        "--exploration-stagnation-threshold",
-        type=int,
-        default=30,
-        help="Stagnant-step count before adaptive exploration kicks in.",
-    )
-    parser.add_argument(
-        "--exploration-temperature",
-        type=float,
-        default=1.5,
-        help="Sampling temperature used while adaptively exploring.",
-    )
-    parser.add_argument(
-        "--shooting-exploration-temperature",
-        type=float,
-        default=1.2,
-        help="Sampling temperature for shooting while adaptively exploring.",
-    )
-    parser.add_argument(
         "--diagnostics-sample-frames",
         type=int,
         default=16,
         help="How many evenly spaced rollout frames to save per update for diagnostics.",
-    )
-    parser.add_argument(
-        "--movement-action-repeat",
-        type=int,
-        default=1,
-        help="How many steps to keep a chosen movement action before resampling it.",
-    )
-    parser.add_argument(
-        "--shooting-action-repeat",
-        type=int,
-        default=1,
-        help="How many steps to keep a chosen shooting action before resampling it.",
-    )
-    parser.add_argument(
-        "--anti-stuck-trigger-steps",
-        type=int,
-        default=45,
-        help="Stagnant-step count before downweighting the current movement direction.",
-    )
-    parser.add_argument(
-        "--anti-stuck-direction-penalty",
-        type=float,
-        default=2.0,
-        help="How strongly to downweight the current movement direction when stuck.",
     )
     parser.add_argument(
         "--bc-anchor-coef",
@@ -134,31 +135,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--bc-anchor-movement-weight",
         type=float,
-        default=1.0,
+        default=defaults.bc_anchor_movement_weight,
         help="Relative BC-anchor weight for the movement head.",
     )
     parser.add_argument(
         "--bc-anchor-shooting-weight",
         type=float,
-        default=2.0,
+        default=defaults.bc_anchor_shooting_weight,
         help="Relative BC-anchor weight for the shooting head.",
     )
     parser.add_argument(
         "--bc-anchor-bomb-weight",
         type=float,
-        default=0.5,
+        default=defaults.bc_anchor_bomb_weight,
         help="Relative BC-anchor weight for the bomb head.",
     )
     parser.add_argument(
         "--early-stop-patience",
         type=int,
-        default=20,
-        help="Stop training after this many updates without a meaningful best-checkpoint metric improvement.",
+        default=defaults.early_stop_patience,
+        help="Stop training after this many episodes without a best-checkpoint improvement.",
     )
     parser.add_argument(
         "--early-stop-min-delta",
         type=float,
-        default=0.0,
+        default=defaults.early_stop_min_delta,
         help="Minimum best-checkpoint metric improvement required to reset early-stopping patience.",
     )
     parser.add_argument(
@@ -237,7 +238,7 @@ def parse_args() -> argparse.Namespace:
         "--room-timeout-steps",
         type=int,
         default=reward_defaults.room_timeout_steps,
-        help="Maximum steps allowed in one room before the episode times out.",
+        help="Maximum steps allowed in a navigation room before the episode times out.",
     )
     parser.add_argument(
         "--room-timeout-penalty",
@@ -276,28 +277,26 @@ def main() -> None:
             title_substring=args.title,
             telemetry_port=args.telemetry_port,
             warmup_seconds=args.warmup_seconds,
-            total_updates=args.updates,
-            rollout_steps=args.rollout_steps,
-            gamma=args.gamma,
+            total_episodes=args.episodes,
+            max_steps_per_episode=args.max_steps_per_episode,
             ppo_epochs=args.ppo_epochs,
             ppo_minibatch_size=args.ppo_minibatch_size,
             ppo_clip_epsilon=args.ppo_clip_epsilon,
             learning_rate=args.learning_rate,
+            gamma=args.gamma,
             entropy_coef=args.entropy_coef,
+            movement_sampling_temperature=args.movement_sampling_temperature,
+            shooting_sampling_temperature=args.shooting_sampling_temperature,
+            bomb_sampling_temperature=args.bomb_sampling_temperature,
+            disable_bomb=args.disable_bomb,
+            target_kl=args.target_kl,
+            min_learning_rate=args.min_learning_rate,
+            max_learning_rate=args.max_learning_rate,
             output_dir=args.output_dir,
             pretrained_model_path=args.pretrained_model,
             prefer_latest_rl_best=args.prefer_latest_rl_best,
             auto_reset=args.auto_reset,
-            deterministic_actions=args.deterministic_actions,
-            adaptive_exploration=not args.no_adaptive_exploration,
-            exploration_stagnation_threshold=args.exploration_stagnation_threshold,
-            exploration_temperature=args.exploration_temperature,
-            shooting_exploration_temperature=args.shooting_exploration_temperature,
             diagnostics_sample_frames=args.diagnostics_sample_frames,
-            movement_action_repeat=args.movement_action_repeat,
-            shooting_action_repeat=args.shooting_action_repeat,
-            anti_stuck_trigger_steps=args.anti_stuck_trigger_steps,
-            anti_stuck_direction_penalty=args.anti_stuck_direction_penalty,
             bc_anchor_coef=args.bc_anchor_coef,
             bc_anchor_movement_weight=args.bc_anchor_movement_weight,
             bc_anchor_shooting_weight=args.bc_anchor_shooting_weight,

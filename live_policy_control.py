@@ -47,6 +47,31 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model-path", default=None,
                         help="Checkpoint path.  Defaults to the latest model.")
+    parser.add_argument(
+        "--sample",
+        action="store_true",
+        help="Sample actions stochastically instead of argmax. Pair with the "
+             "training-time temperatures to match the distribution the RL "
+             "policy was optimized under.",
+    )
+    parser.add_argument(
+        "--movement-temperature",
+        type=float,
+        default=1.0,
+        help="Temperature applied to movement logits.",
+    )
+    parser.add_argument(
+        "--shooting-temperature",
+        type=float,
+        default=1.0,
+        help="Temperature applied to shooting logits.",
+    )
+    parser.add_argument(
+        "--bomb-temperature",
+        type=float,
+        default=1.0,
+        help="Temperature applied to bomb logits.",
+    )
     return parser.parse_args()
 
 
@@ -139,6 +164,10 @@ def main() -> None:
             model, device, observation,
             checkpoint=checkpoint,
             nav_hint=nav_hint,
+            movement_temperature=args.movement_temperature,
+            shooting_temperature=args.shooting_temperature,
+            bomb_temperature=args.bomb_temperature,
+            sample=args.sample,
         )
         selected_action = prediction_to_action(prediction, bomb_threshold=BOMB_THRESHOLD)
         game_has_focus = env.capture.is_foreground()

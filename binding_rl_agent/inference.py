@@ -43,22 +43,13 @@ def find_latest_model(models_dir: str | Path = "models") -> Path:
     return candidates[0] / "bc_policy.pt"
 
 
-def load_policy_checkpoint(
-    model_path: str | Path,
-) -> tuple[IsaacCNNPolicy, torch.device, dict]:
-    checkpoint_path = Path(model_path)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    try:
-        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    except TypeError:
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-
+def policy_kwargs_from_checkpoint(checkpoint: dict) -> dict:
+    """Return kwargs for IsaacCNNPolicy inferred from a BC checkpoint dict."""
     train_cfg = checkpoint.get("train_config", {})
     conv_channels = tuple(train_cfg.get("conv_channels", (8, 16, 16)))
     hidden_dim = int(train_cfg.get("hidden_dim", 128))
     frame_size = int(train_cfg.get("frame_size", 128))
 
-    # Derive input_channels from train_config when not explicitly stored at top level.
     if "input_channels" in checkpoint:
         input_channels = int(checkpoint["input_channels"])
     else:
@@ -77,7 +68,7 @@ def load_policy_checkpoint(
     num_resblocks = int(train_cfg.get("num_resblocks", 2))
     dropout = float(train_cfg.get("dropout", 0.0))
 
-    common_kwargs = dict(
+    return dict(
         input_channels=input_channels,
         input_size=frame_size,
         num_movement_actions=len(checkpoint.get("movement_names", MOVEMENT_NAMES)),
@@ -92,6 +83,45 @@ def load_policy_checkpoint(
         dropout=dropout,
     )
 
+
+def motion_channels_from_checkpoint(checkpoint: dict) -> bool:
+    return bool(checkpoint.get("train_config", {}).get("motion_channels", False))
+
+
+def _unwrap_rl_checkpoint(checkpoint: dict) -> dict:
+    """If this is an RL (actor-critic) checkpoint, return a BC-shaped checkpoint.
+
+    RL checkpoints embed the BC architecture metadata under ``bc_checkpoint`` and
+    save weights with ``policy.`` and ``value_head.`` prefixes. To reuse the BC
+    inference path, we synthesise a BC-shaped dict: BC's ``train_config`` etc.
+    at the top level, plus a state_dict with the ``policy.`` prefix stripped
+    (and ``value_head.`` keys dropped — BC inference doesn't need them).
+    """
+    state_dict = checkpoint.get("model_state_dict", {})
+    has_policy_prefix = any(key.startswith("policy.") for key in state_dict)
+    bc_checkpoint = checkpoint.get("bc_checkpoint")
+    if not has_policy_prefix or not isinstance(bc_checkpoint, dict):
+        return checkpoint
+    stripped_state_dict = {
+        key.removeprefix("policy."): value
+        for key, value in state_dict.items()
+        if key.startswith("policy.")
+    }
+    return {**bc_checkpoint, "model_state_dict": stripped_state_dict}
+
+
+def load_policy_checkpoint(
+    model_path: str | Path,
+) -> tuple[IsaacCNNPolicy, torch.device, dict]:
+    checkpoint_path = Path(model_path)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    except TypeError:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    checkpoint = _unwrap_rl_checkpoint(checkpoint)
+    common_kwargs = policy_kwargs_from_checkpoint(checkpoint)
     model = IsaacCNNPolicy(**common_kwargs)
 
     state_dict = checkpoint["model_state_dict"]
@@ -129,12 +159,21 @@ def predict_policy(
     observation: np.ndarray,
     checkpoint: dict | None = None,
     nav_hint: int | None = None,
+    movement_temperature: float = 1.0,
+    shooting_temperature: float = 1.0,
+    bomb_temperature: float = 1.0,
+    sample: bool = False,
 ) -> PolicyPrediction:
     """Run a forward pass and return structured predictions.
 
     nav_hint is an integer class (0=STAY, 1=N, 2=S, 3=W, 4=E) — required when
     the model was trained with ``use_nav_hint_embedding=True``; if omitted the
     model falls back to STAY (class 0).
+
+    Per-head temperatures cool/warm the logits before action selection. When
+    ``sample=True``, actions are drawn from the (cooled) categorical distribution
+    rather than taken as argmax — useful at inference time to match the
+    stochastic distribution the policy was optimized under during PPO training.
     """
     obs_f = torch.from_numpy(observation).float() / 255.0
     train_cfg = checkpoint.get("train_config", {}) if checkpoint else {}
@@ -154,14 +193,21 @@ def predict_policy(
     with torch.no_grad():
         logits = model(observation_tensor, nav_hint=nav_hint_tensor)
 
+    head_temperatures = {
+        "movement": max(movement_temperature, 1e-3),
+        "shooting": max(shooting_temperature, 1e-3),
+        "bomb": max(bomb_temperature, 1e-3),
+    }
+    cooled_logits = {k: v / head_temperatures[k] for k, v in logits.items()}
+
     movement_names = checkpoint.get("movement_names", MOVEMENT_NAMES) if checkpoint else MOVEMENT_NAMES
     shooting_names = checkpoint.get("shooting_names", SHOOTING_NAMES) if checkpoint else SHOOTING_NAMES
     bomb_names = checkpoint.get("bomb_names", BOMB_NAMES) if checkpoint else BOMB_NAMES
 
     return PolicyPrediction(
-        movement=_decode_head(logits["movement"], movement_names),
-        shooting=_decode_head(logits["shooting"], shooting_names),
-        bomb=_decode_head(logits["bomb"], bomb_names),
+        movement=_decode_head(cooled_logits["movement"], movement_names, sample=sample),
+        shooting=_decode_head(cooled_logits["shooting"], shooting_names, sample=sample),
+        bomb=_decode_head(cooled_logits["bomb"], bomb_names, sample=sample),
         device=str(device),
     )
 
@@ -182,9 +228,13 @@ def nav_hint_from_room_graph(
 def _decode_head(
     logits: torch.Tensor,
     label_map: dict[int, str],
+    sample: bool = False,
 ) -> HeadPrediction:
     probabilities = torch.softmax(logits[0], dim=0)
-    index = int(torch.argmax(probabilities).item())
+    if sample:
+        index = int(torch.multinomial(probabilities, 1).item())
+    else:
+        index = int(torch.argmax(probabilities).item())
     confidence = float(probabilities[index].item())
     return HeadPrediction(
         index=index,
